@@ -57,6 +57,16 @@ class StoredResource:
     resource: PatientResource
     version: int
     updated_at: float
+    # True when this result was replayed from the idempotency ledger rather
+    # than newly applied; callers must not write a second audit record.
+    replayed: bool = False
+
+
+@dataclass(frozen=True)
+class VersionEntry:
+    """One row of a patient's version history (metadata only)."""
+    version: int
+    updated_at: float
 
 
 @dataclass(frozen=True)

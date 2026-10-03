@@ -18,6 +18,8 @@ class ErrorCode(str, Enum):
     # Concurrency
     VERSION_CONFLICT = "version_conflict"
     NOT_FOUND = "not_found"
+    # History: patient exists but the requested version does not
+    VERSION_NOT_FOUND = "version_not_found"
     # Access control
     FORBIDDEN = "forbidden"
     UNAUTHENTICATED = "unauthenticated"

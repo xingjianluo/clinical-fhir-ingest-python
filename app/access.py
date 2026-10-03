@@ -31,6 +31,11 @@ def check_read(role: Role, *, identified: bool) -> None:
         )
 
 
+def can_read_identified(role: Role) -> bool:
+    """True if the role may see direct identifiers (else de-identified only)."""
+    return role in _IDENTIFIED_READ_ROLES
+
+
 def check_write(role: Role) -> None:
     """Raise AccessDeniedError if the role may not write."""
     if role not in _WRITE_ROLES:

@@ -22,6 +22,7 @@ _STATUS_BY_CODE = {
     ErrorCode.MALFORMED_PAYLOAD: 400,
     ErrorCode.VERSION_CONFLICT: 409,
     ErrorCode.NOT_FOUND: 404,
+    ErrorCode.VERSION_NOT_FOUND: 404,
     ErrorCode.FORBIDDEN: 403,
     ErrorCode.UNAUTHENTICATED: 401,
 }
@@ -66,9 +67,11 @@ def read_root():
 def ingest(payload: dict, source_version: str,
            x_actor: str | None = Header(None),
            x_role: str | None = Header(None),
+           idempotency_key: str | None = Header(None),
            svc: ClinicalService = Depends(get_service)):
     actor, role = _caller(x_actor, x_role)
-    return svc.ingest(payload, source_version, actor=actor, role=role)
+    return svc.ingest(payload, source_version, actor=actor, role=role,
+                      request_id=idempotency_key)
 
 
 @app.put("/patients/{patient_id}")
@@ -76,10 +79,11 @@ def update(patient_id: str, payload: dict, source_version: str,
            expected_version: int,
            x_actor: str | None = Header(None),
            x_role: str | None = Header(None),
+           idempotency_key: str | None = Header(None),
            svc: ClinicalService = Depends(get_service)):
     actor, role = _caller(x_actor, x_role)
     return svc.update(patient_id, payload, source_version, expected_version,
-                      actor=actor, role=role)
+                      actor=actor, role=role, request_id=idempotency_key)
 
 
 @app.get("/patients/{patient_id}")
@@ -98,3 +102,21 @@ def export(patient_id: str,
            svc: ClinicalService = Depends(get_service)):
     actor, role = _caller(x_actor, x_role)
     return svc.export(patient_id, actor=actor, role=role)
+
+
+@app.get("/patients/{patient_id}/history")
+def history(patient_id: str,
+            x_actor: str | None = Header(None),
+            x_role: str | None = Header(None),
+            svc: ClinicalService = Depends(get_service)):
+    actor, role = _caller(x_actor, x_role)
+    return svc.history(patient_id, actor=actor, role=role)
+
+
+@app.get("/patients/{patient_id}/history/{version}")
+def read_version(patient_id: str, version: int,
+                 x_actor: str | None = Header(None),
+                 x_role: str | None = Header(None),
+                 svc: ClinicalService = Depends(get_service)):
+    actor, role = _caller(x_actor, x_role)
+    return svc.read_version(patient_id, version, actor=actor, role=role)

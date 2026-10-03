@@ -105,3 +105,82 @@ def test_concurrent_writers_exactly_one_wins_per_version(svc):
     assert len(wins) >= 1
     # version advanced exactly once per winning write: no lost, no duplicate
     assert final["version"] == 1 + len(wins)
+
+
+def test_idempotent_retry_creates_no_extra_version_or_audit(svc):
+    """A retried submission (timeout/network) replays the recorded response:
+    no new version, no second 'success' audit entry."""
+    key = "submit-42"
+    first = svc.ingest(payload("p-4", "once"), "fhir-r4",
+                       idempotency_key=key, **ADMIN)
+    # client retries the exact same submission after a timeout
+    second = svc.ingest(payload("p-4", "once"), "fhir-r4",
+                        idempotency_key=key, **ADMIN)
+    log.info("input=ingest(p-4) key=%s retried decision: first=%s second=%s",
+             key, first, second)
+    assert first == {"patient_id": "p-4", "version": 1}
+    assert second == first                      # same recorded response
+    assert svc.read("p-4", **ADMIN)["version"] == 1  # no extra version
+
+    successes = [a for a in svc.audit_trail()
+                 if a.action == "ingest" and a.outcome == "success"]
+    replays = [a for a in svc.audit_trail()
+               if a.action == "ingest" and a.outcome == "replayed"]
+    log.info("decision: success audits=%d replayed audits=%d",
+             len(successes), len(replays))
+    assert len(successes) == 1   # the logical write is audited exactly once
+    assert len(replays) == 1     # the retry is visible but not a duplicate
+
+
+def test_idempotency_key_reused_with_different_payload_rejected(svc):
+    key = "submit-43"
+    svc.ingest(payload("p-5", "a"), "fhir-r4", idempotency_key=key, **ADMIN)
+    from app.errors import IngestionError
+    with pytest.raises(IngestionError) as exc:
+        svc.ingest(payload("p-5", "DIFFERENT"), "fhir-r4",
+                   idempotency_key=key, **ADMIN)
+    log.info("input=ingest key=%s different payload decision: code=%s",
+             key, exc.value.code)
+    assert exc.value.code is ErrorCode.MALFORMED_PAYLOAD
+
+
+def test_concurrent_same_key_submissions_commit_exactly_once(svc):
+    """Two clients racing with the same idempotency key: one commits, the
+    other replays — exactly one version and one success audit entry."""
+    key = "race-1"
+    results, barrier = [], threading.Barrier(2)
+
+    def submit():
+        barrier.wait()
+        results.append(svc.ingest(payload("p-6", "raced"), "fhir-r4",
+                                  idempotency_key=key, **ADMIN))
+
+    threads = [threading.Thread(target=submit) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    log.info("input=2 concurrent same-key submits decision: results=%s", results)
+    assert results == [{"patient_id": "p-6", "version": 1}] * 2
+    assert svc.read("p-6", **ADMIN)["version"] == 1
+    successes = [a for a in svc.audit_trail()
+                 if a.action == "ingest" and a.outcome == "success"]
+    assert len(successes) == 1
+
+
+def test_idempotent_update_retry_does_not_bump_version(svc):
+    svc.ingest(payload("p-7", "v1"), "fhir-r4", **ADMIN)
+    key = "upd-1"
+    first = svc.update("p-7", payload("p-7", "v2"), "fhir-r4",
+                       expected_version=1, idempotency_key=key, **ADMIN)
+    second = svc.update("p-7", payload("p-7", "v2"), "fhir-r4",
+                        expected_version=1, idempotency_key=key, **ADMIN)
+    log.info("input=update(p-7) key=%s retried decision: first=%s second=%s",
+             key, first, second)
+    assert first == {"patient_id": "p-7", "version": 2}
+    assert second == first
+    # without the key the same stale update would be a VERSION_CONFLICT
+    assert svc.read("p-7", **ADMIN)["version"] == 2
+    history = svc.history("p-7", **ADMIN)
+    assert [v["version"] for v in history["versions"]] == [1, 2]

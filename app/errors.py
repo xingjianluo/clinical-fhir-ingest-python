@@ -18,6 +18,7 @@ class ErrorCode(str, Enum):
     # Concurrency
     VERSION_CONFLICT = "version_conflict"
     NOT_FOUND = "not_found"
+    VERSION_NOT_FOUND = "version_not_found"
     # Access control
     FORBIDDEN = "forbidden"
     UNAUTHENTICATED = "unauthenticated"
@@ -48,6 +49,11 @@ class ConcurrencyError(ServiceError):
 
 class NotFoundError(ServiceError):
     """Resource does not exist (distinct from VERSION_CONFLICT)."""
+
+
+class VersionNotFoundError(ServiceError):
+    """Patient exists but the requested version snapshot does not
+    (distinct from NOT_FOUND and VERSION_CONFLICT)."""
 
 
 class AccessDeniedError(ServiceError):

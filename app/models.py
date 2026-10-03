@@ -72,7 +72,7 @@ class AuditRecord:
 
     @staticmethod
     def new(actor: str, role: str, action: str, patient_id: str | None,
-            outcome: str, detail: str) -> "AuditRecord":
+            outcome: str, detail: str) -> AuditRecord:
         return AuditRecord(
             audit_id=str(uuid.uuid4()),
             timestamp=time.time(),

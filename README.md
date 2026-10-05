@@ -45,7 +45,11 @@ app/errors.py      可区分的错误分类（ErrorCode）
   `UPDATE ... WHERE patient_id=? AND version=?` 的比较-交换。
 - 过期版本提交返回 **409 `version_conflict`**，并在 `detail` 中给出
   `expected_version` 与 `current_version`；资源不存在返回
-  **404 `not_found`**，两种原因严格可区分。
+  **404 `not_found`**，两种原因严格可区分。多个客户端同时更新同一
+  患者时，基于同一版本的提交恰好只有一个成功，其余全部以
+  `version_conflict` 拒绝。
+- 凡已成功返回的写入，在返回前已提交落库：之后任何一次读取都能查到，
+  重启后仍在。
 - 冲突后的安全重试模式：重新读取当前版本 → 以新版本号重提交。
   重试不会产生重复写入，也不会丢失更新（版本号恰好等于
   `1 + 成功写入次数`，由并发测试验证）。
@@ -79,6 +83,25 @@ app/errors.py      可区分的错误分类（ErrorCode）
 - **兼容规则**：历史快照按写入时的归一化内部模型存储，读取时按当前
   模型反序列化；旧版本快照永远保持写入时的内容（不可变），不会被
   后续更新改写。
+- **中断语义**：幂等键记录与资源写入在**同一个事务**中提交。服务在
+  提交中途崩溃或重启时，要么写入与幂等键一起落库（客户端重试会干净
+  地重放首次响应），要么一起回滚（客户端重试作为全新提交重新执行），
+  不存在"写入了但幂等键丢失"的中间态，因此重试不会报
+  `version_conflict` 也不会重复写入。
+
+### 老数据升级（无历史表的库）
+
+早期版本只写 `resources` 当前状态表（无 `resource_history`）。直接用
+当前版本打开这种老库时，启动事务内自动执行一次性迁移：
+
+- 对每个没有任何历史行的患者，按当前版本号 N 回填第 1..N 版历史行，
+  使**每一次历史成功写入都能按顺序列出、带写入时间、可按版本号取回**。
+- 第 N 版（当前版）使用真实的最后写入内容与时间戳；第 1..N-1 版的
+  逐版内容老版本从未保存、无法恢复，迁移以最后已知内容回填（内容与
+  时间戳取自最后一次写入），属于尽力重建，迁移日志会打印
+  `legacy migration: patient=... backfilled ...` 标明。
+- 迁移幂等且与建表同属一个事务：重复打开不会重复回填，迁移中途崩溃
+  会在下次打开时整体重来；升级后的新写入照常追加真实快照。
 
 ## 版本历史读取
 
@@ -150,6 +173,39 @@ curl -H 'X-Actor: bob' -H 'X-Role: researcher' \
   http://127.0.0.1:8000/patients/p1/export    # 去标识化视图
 ```
 
+### 复现老数据升级
+
+```bash
+# 1. 造一个"老版本"库：只有 resources 当前状态表（模拟旧版服务攒下的数据）
+uv run python - << 'EOF'
+import json, sqlite3
+conn = sqlite3.connect("./data/legacy.db")
+conn.executescript("""
+CREATE TABLE resources (patient_id TEXT PRIMARY KEY, version INTEGER NOT NULL,
+                        updated_at REAL NOT NULL, body TEXT NOT NULL);
+""")
+body = {"patient_id": "p1", "active": True, "identifiers": {"mrn": "M1"},
+        "observations": [{"code": {"system": "http://loinc.org", "code": "8480-6",
+                                   "display": None},
+                          "value": "120", "unit": None, "effective": None}]}
+conn.execute("INSERT INTO resources VALUES ('p1', 3, 1700000003.0, ?)",
+             (json.dumps(body, sort_keys=True),))
+conn.commit(); conn.close()
+EOF
+
+# 2. 用当前版本直接打开（无需清空或重新导入），迁移自动发生
+CLINICAL_DB=./data/legacy.db uv run uvicorn main:app --port 8000 &
+
+# 3. 验证：当前内容、按顺序的历史（含写入时间）、按版本回看都可用
+curl -H 'X-Actor: alice' -H 'X-Role: clinician' \
+  http://127.0.0.1:8000/patients/p1            # 当前内容：version 3
+curl -H 'X-Actor: alice' -H 'X-Role: clinician' \
+  http://127.0.0.1:8000/patients/p1/history    # v1..v3 按序列出，含 updated_at
+curl -H 'X-Actor: alice' -H 'X-Role: clinician' \
+  http://127.0.0.1:8000/patients/p1/versions/3 # 按版本号取回，不再 404
+# 升级后继续写入：expected_version=3 -> 提交成功得到 v4，历史变为 v1..v4
+```
+
 ### 复现重启恢复与版本历史
 
 ```bash
@@ -187,8 +243,12 @@ curl -X PUT 'http://127.0.0.1:8000/patients/p1?source_version=fhir-r4&expected_v
 #   -> 版本从 2 继续递增到 3，历史不断档
 ```
 
-测试覆盖：并发冲突（过期版本 vs 不存在的区分、重试安全性、多写者竞争、
-幂等 key 重试与并发去重）、重启后状态/历史/审计/幂等记录的持久性、
-版本历史顺序与按版本回溯、历史读取的角色控制与去标识化、三类失败原因
-（not_found / version_not_found / forbidden）的可区分性、版本不兼容
-（三类拒绝原因可区分）、越权读取与去标识化导出、审计完整性。
+测试覆盖：老库升级迁移（历史回填、按版本回看、迁移幂等与跨重启一致）、
+并发冲突（过期版本 vs 不存在的区分、重试安全性、多写者竞争、同一过期
+版本下恰好一个成功的成败分类、幂等 key 重试与并发去重）、重启后状态/
+历史/审计/幂等记录的持久性、崩溃中断的原子性（不留半截提交，重试干净
+重放或重新执行）、版本历史顺序与按版本回溯、历史读取的角色控制与去标
+识化、三类失败原因（not_found / version_not_found / forbidden）的可区
+分性、版本不兼容（三类拒绝原因可区分）、越权读取与去标识化导出、审计
+完整性。运行 `uv run pytest -q --log-cli-level=INFO` 时，每条用例会
+打印输入、版本号与判定依据（如 `decision: code=... detail=...`）。

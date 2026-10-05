@@ -107,6 +107,58 @@ def test_concurrent_writers_exactly_one_wins_per_version(svc):
     assert final["version"] == 1 + len(wins)
 
 
+def test_concurrent_stale_writes_classified_exactly_one_wins(tmp_path):
+    """N clients all submit against the same (soon-stale) version: exactly
+    one commits, the rest are rejected as VERSION_CONFLICT with the current
+    version in detail; the winning write is immediately readable and still
+    there after a restart."""
+    db = str(tmp_path / "race.db")
+    svc = ClinicalService(db)
+    svc.ingest(payload("p-race", "base"), "fhir-r4", **ADMIN)
+
+    wins, conflicts = [], []
+    barrier = threading.Barrier(8)
+
+    def worker(i: int):
+        barrier.wait()
+        try:
+            svc.update("p-race", payload("p-race", f"w{i}"), "fhir-r4",
+                       expected_version=1, **ADMIN)  # all race on version 1
+            wins.append(i)
+        except ConcurrencyError as e:
+            conflicts.append(e)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    log.info("input=8 writers all expecting v1 decision: wins=%s conflicts=%d",
+             wins, len(conflicts))
+    assert len(wins) == 1                       # only the latest-based commit
+    assert len(conflicts) == 7
+    for e in conflicts:                         # each rejection explains itself
+        assert e.code is ErrorCode.VERSION_CONFLICT
+        assert e.detail["expected_version"] == 1
+        assert e.detail["current_version"] == 2
+
+    # The committed write is visible to any later read...
+    final = svc.read("p-race", **ADMIN)
+    assert final["version"] == 2
+    assert final["identifiers"]["mrn"] == f"w{wins[0]}"
+    assert [v["version"] for v in svc.history("p-race", **ADMIN)["versions"]] == [1, 2]
+    svc.close()
+
+    # ...and survives a restart (committed before the success response).
+    svc2 = ClinicalService(db)
+    after = svc2.read("p-race", **ADMIN)
+    log.info("after restart: version=%s mrn=%s",
+             after["version"], after["identifiers"]["mrn"])
+    assert after == final
+    svc2.close()
+
+
 def test_idempotent_retry_creates_no_extra_version_or_audit(svc):
     """A retried submission (timeout/network) replays the recorded response:
     no new version, no second 'success' audit entry."""

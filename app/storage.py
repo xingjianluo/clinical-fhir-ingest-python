@@ -52,6 +52,20 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
 );
 """
 
+# Upgrade migration for databases written by builds that predate the
+# resource_history table: those files only carry each patient's *current*
+# row. Backfill a history snapshot for the current version of every resource
+# that has none, so history is never empty and the current version is always
+# retrievable by number. Earlier intermediate versions were never recorded
+# by the old build and cannot be fabricated — reads of those versions keep
+# raising VERSION_NOT_FOUND with the requested version in the detail.
+# INSERT OR IGNORE makes the migration idempotent: reopening a migrated or
+# fresh database is a no-op.
+_MIGRATE_BACKFILL_HISTORY = """
+INSERT OR IGNORE INTO resource_history (patient_id, version, updated_at, body)
+SELECT patient_id, version, updated_at, body FROM resources;
+"""
+
 
 def _serialize(resource: PatientResource) -> str:
     return json.dumps(asdict(resource), sort_keys=True)
@@ -85,6 +99,7 @@ class ResourceStore:
         self._lock = threading.RLock()
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
+            self._conn.execute(_MIGRATE_BACKFILL_HISTORY)
 
     def get(self, patient_id: str) -> StoredResource:
         """Return the stored resource or raise NotFoundError."""
@@ -101,72 +116,92 @@ class ResourceStore:
             )
         return _deserialize(patient_id, row[0], row[1], row[2])
 
-    def create(self, resource: PatientResource) -> StoredResource:
+    def create(self, resource: PatientResource, *, commit: bool = True) -> StoredResource:
         """Insert a new resource at version 1; duplicate ids are rejected.
 
         The current row and its first history snapshot are written in one
         transaction, so current state and history can never diverge and both
-        survive a restart (same SQLite file).
+        survive a restart (same SQLite file). ``commit=False`` skips the
+        transaction wrapper so callers (``apply_idempotent``) can bundle the
+        write with more statements in a single atomic commit.
         """
+        with self._lock:
+            if commit:
+                with self._conn:
+                    return self._create_locked(resource)
+            return self._create_locked(resource)
+
+    def _create_locked(self, resource: PatientResource) -> StoredResource:
+        """``create`` with the lock already held and no commit of its own."""
         now = time.time()
         body = _serialize(resource)
-        with self._lock, self._conn:
-            try:
-                self._conn.execute(
-                    "INSERT INTO resources (patient_id, version, updated_at, body)"
-                    " VALUES (?, 1, ?, ?)",
-                    (resource.patient_id, now, body),
-                )
-                self._conn.execute(
-                    "INSERT INTO resource_history"
-                    " (patient_id, version, updated_at, body) VALUES (?, 1, ?, ?)",
-                    (resource.patient_id, now, body),
-                )
-            except sqlite3.IntegrityError:
-                raise ConcurrencyError(
-                    ErrorCode.VERSION_CONFLICT,
-                    f"patient '{resource.patient_id}' already exists",
-                    detail={"patient_id": resource.patient_id},
-                ) from None
+        try:
+            self._conn.execute(
+                "INSERT INTO resources (patient_id, version, updated_at, body)"
+                " VALUES (?, 1, ?, ?)",
+                (resource.patient_id, now, body),
+            )
+            self._conn.execute(
+                "INSERT INTO resource_history"
+                " (patient_id, version, updated_at, body) VALUES (?, 1, ?, ?)",
+                (resource.patient_id, now, body),
+            )
+        except sqlite3.IntegrityError:
+            raise ConcurrencyError(
+                ErrorCode.VERSION_CONFLICT,
+                f"patient '{resource.patient_id}' already exists",
+                detail={"patient_id": resource.patient_id},
+            ) from None
         return StoredResource(resource=resource, version=1, updated_at=now)
 
-    def update(self, resource: PatientResource, expected_version: int) -> StoredResource:
+    def update(self, resource: PatientResource, expected_version: int,
+               *, commit: bool = True) -> StoredResource:
         """Compare-and-swap update; stale versions raise ConcurrencyError.
 
         On success the new snapshot is appended to resource_history in the
-        same transaction as the current-row swap.
+        same transaction as the current-row swap. ``commit=False`` skips the
+        transaction wrapper so callers (``apply_idempotent``) can bundle the
+        write with more statements in a single atomic commit.
         """
+        with self._lock:
+            if commit:
+                with self._conn:
+                    return self._update_locked(resource, expected_version)
+            return self._update_locked(resource, expected_version)
+
+    def _update_locked(self, resource: PatientResource,
+                       expected_version: int) -> StoredResource:
+        """``update`` with the lock already held and no commit of its own."""
         now = time.time()
         body = _serialize(resource)
-        with self._lock, self._conn:
-            cursor = self._conn.execute(
-                "UPDATE resources SET version=version+1, updated_at=?, body=?"
-                " WHERE patient_id=? AND version=?",
-                (now, body, resource.patient_id, expected_version),
-            )
-            if cursor.rowcount == 0:
-                exists = self._conn.execute(
-                    "SELECT version FROM resources WHERE patient_id=?",
-                    (resource.patient_id,),
-                ).fetchone()
-                if exists is None:
-                    raise NotFoundError(
-                        ErrorCode.NOT_FOUND,
-                        f"patient '{resource.patient_id}' does not exist",
-                        detail={"patient_id": resource.patient_id},
-                    )
-                raise ConcurrencyError(
-                    ErrorCode.VERSION_CONFLICT,
-                    f"stale version {expected_version}; current is {exists[0]}",
-                    detail={"patient_id": resource.patient_id,
-                            "expected_version": expected_version,
-                            "current_version": exists[0]},
+        cursor = self._conn.execute(
+            "UPDATE resources SET version=version+1, updated_at=?, body=?"
+            " WHERE patient_id=? AND version=?",
+            (now, body, resource.patient_id, expected_version),
+        )
+        if cursor.rowcount == 0:
+            exists = self._conn.execute(
+                "SELECT version FROM resources WHERE patient_id=?",
+                (resource.patient_id,),
+            ).fetchone()
+            if exists is None:
+                raise NotFoundError(
+                    ErrorCode.NOT_FOUND,
+                    f"patient '{resource.patient_id}' does not exist",
+                    detail={"patient_id": resource.patient_id},
                 )
-            self._conn.execute(
-                "INSERT INTO resource_history"
-                " (patient_id, version, updated_at, body) VALUES (?, ?, ?, ?)",
-                (resource.patient_id, expected_version + 1, now, body),
+            raise ConcurrencyError(
+                ErrorCode.VERSION_CONFLICT,
+                f"stale version {expected_version}; current is {exists[0]}",
+                detail={"patient_id": resource.patient_id,
+                        "expected_version": expected_version,
+                        "current_version": exists[0]},
             )
+        self._conn.execute(
+            "INSERT INTO resource_history"
+            " (patient_id, version, updated_at, body) VALUES (?, ?, ?, ?)",
+            (resource.patient_id, expected_version + 1, now, body),
+        )
         return StoredResource(resource=resource, version=expected_version + 1,
                               updated_at=now)
 
@@ -218,41 +253,71 @@ class ResourceStore:
             ).fetchall()
         return [_deserialize(patient_id, v, ts, body) for v, ts, body in rows]
 
+    def _record_key(self, key: str, fingerprint: str, response: dict) -> None:
+        """Insert the idempotency record; runs inside the caller's
+        transaction so it commits (or rolls back) together with the write."""
+        self._conn.execute(
+            "INSERT INTO idempotency_keys (key, fingerprint, response,"
+            " created_at) VALUES (?,?,?,?)",
+            (key, fingerprint, json.dumps(response, sort_keys=True),
+             time.time()),
+        )
+
+    def _lookup_key(self, key: str, fingerprint: str) -> dict | None:
+        """Recorded response for ``key``, or None if never committed.
+
+        A key reused with a *different* request fingerprint is rejected as
+        MALFORMED_PAYLOAD so the two cases stay distinguishable.
+        """
+        row = self._conn.execute(
+            "SELECT fingerprint, response FROM idempotency_keys WHERE key=?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row[0] != fingerprint:
+            raise IngestionError(
+                ErrorCode.MALFORMED_PAYLOAD,
+                f"idempotency key '{key}' was already used with a"
+                " different request",
+                detail={"idempotency_key": key},
+            )
+        return json.loads(row[1])
+
     def apply_idempotent(self, key: str, fingerprint: str, fn) -> tuple[dict, bool]:
-        """Run ``fn`` (a create/update) exactly once per idempotency key.
+        """Run ``fn`` (a non-committing create/update) exactly once per key.
 
         Returns ``(response, replayed)``. If the key was already committed,
         the recorded response is returned without invoking ``fn`` — a retried
-        submission never creates an extra version. Reusing the same key with
-        a *different* request fingerprint is rejected as MALFORMED_PAYLOAD so
-        the two cases stay distinguishable. The lookup, write and key record
-        happen under one lock, so concurrent retries of the same key are
-        serialized and exactly one of them performs the write.
+        submission never creates an extra version, even if the retry arrives
+        after a restart (the record lives in the same SQLite file).
+
+        The write and the idempotency record commit in ONE transaction:
+        a crash or restart anywhere in the middle leaves either both or
+        neither behind, so a later retry either replays the recorded
+        response or performs the write cleanly — never errors out with a
+        half-applied state, never writes twice. The lookup, write and key
+        record happen under one lock, so concurrent retries of the same key
+        are serialized and exactly one of them performs the write.
         """
         with self._lock:
-            row = self._conn.execute(
-                "SELECT fingerprint, response FROM idempotency_keys WHERE key=?",
-                (key,),
-            ).fetchone()
-            if row is not None:
-                if row[0] != fingerprint:
-                    raise IngestionError(
-                        ErrorCode.MALFORMED_PAYLOAD,
-                        f"idempotency key '{key}' was already used with a"
-                        " different request",
-                        detail={"idempotency_key": key},
-                    )
-                return json.loads(row[1]), True
-            stored: StoredResource = fn()  # create/update; same RLock, commits
-            response = {"patient_id": stored.resource.patient_id,
-                        "version": stored.version}
-            with self._conn:
-                self._conn.execute(
-                    "INSERT INTO idempotency_keys (key, fingerprint, response,"
-                    " created_at) VALUES (?,?,?,?)",
-                    (key, fingerprint, json.dumps(response, sort_keys=True),
-                     time.time()),
-                )
+            recorded = self._lookup_key(key, fingerprint)
+            if recorded is not None:
+                return recorded, True
+            try:
+                with self._conn:
+                    stored = fn()  # create/update with commit=False
+                    response = {"patient_id": stored.resource.patient_id,
+                                "version": stored.version}
+                    self._record_key(key, fingerprint, response)
+            except sqlite3.IntegrityError:
+                # Another process committed the same key between our lookup
+                # and our insert; the transaction rolled our write back, so
+                # the recorded response is the single source of truth.
+                recorded = self._lookup_key(key, fingerprint)
+                if recorded is not None:
+                    return recorded, True
+                raise
             return response, False
 
     def close(self) -> None:

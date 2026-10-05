@@ -90,3 +90,66 @@ def test_concurrent_services_share_one_store(tmp_path):
     assert a.read("p-x", **ADMIN)["identifiers"]["mrn"] == "from-b"
     a.close()
     b.close()
+
+
+def test_concurrent_writes_on_persistent_store_then_restart(tmp_path):
+    """Many clients race on one patient of a file-backed service: only
+    latest-version commits win, stale ones are rejected with the deciding
+    versions in the detail, and every committed write is readable afterwards
+    — including after a restart."""
+    import threading
+
+    from app.errors import ConcurrencyError
+
+    db = str(tmp_path / "race.db")
+    svc = ClinicalService(db)
+    svc.ingest(payload("p-c", "base"), "fhir-r4", **ADMIN)
+
+    wins, conflicts = [], []
+    barrier = threading.Barrier(8)
+
+    def worker(i: int):
+        barrier.wait()
+        try:
+            current = svc.read("p-c", **ADMIN)
+            svc.update("p-c", payload("p-c", f"w{i}"), "fhir-r4",
+                       expected_version=current["version"], **ADMIN)
+            wins.append(i)
+        except ConcurrencyError as e:
+            conflicts.append(e.detail)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    final = svc.read("p-c", **ADMIN)
+    log.info("8 concurrent writers decision: wins=%d conflicts=%d "
+             "final_version=%s", len(wins), len(conflicts), final["version"])
+    assert len(wins) + len(conflicts) == 8
+    assert len(wins) >= 1
+    # every rejection names the deciding versions: stale expected vs current
+    for detail in conflicts:
+        assert detail["expected_version"] < detail["current_version"]
+    # version advanced exactly once per accepted write
+    assert final["version"] == 1 + len(wins)
+
+    # every committed write is retrievable by version, in order, with times
+    history = svc.history("p-c", **ADMIN)["versions"]
+    assert [v["version"] for v in history] == list(range(1, final["version"] + 1))
+    stamps = [v["updated_at"] for v in history]
+    assert stamps == sorted(stamps)
+    snapshots = {version: svc.read_version("p-c", version, **ADMIN)
+                 for version in range(1, final["version"] + 1)}
+    svc.close()
+
+    # After a restart the committed state is bit-for-bit identical.
+    svc2 = ClinicalService(db)
+    assert svc2.read("p-c", **ADMIN) == final
+    assert svc2.history("p-c", **ADMIN)["versions"] == history
+    for version, snap in snapshots.items():
+        assert svc2.read_version("p-c", version, **ADMIN) == snap
+    log.info("post-restart: current, %d history entries and %d snapshots "
+             "all identical", len(history), len(snapshots))
+    svc2.close()

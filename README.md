@@ -79,6 +79,19 @@ app/errors.py      可区分的错误分类（ErrorCode）
 - **兼容规则**：历史快照按写入时的归一化内部模型存储，读取时按当前
   模型反序列化；旧版本快照永远保持写入时的内容（不可变），不会被
   后续更新改写。
+- **老数据升级（无历史表的库）**：更早版本的服务只写 `resources` 当前行，
+  没有 `resource_history` / `idempotency_keys` 表。用当前版本直接打开
+  这种老库时，启动迁移会（幂等地）为每个患者把**当前版本**的快照回填进
+  历史表：历史不再为空、当前版本可按版本号取回、写入时间沿用原行的
+  `updated_at`，后续写入从当前版本号继续递增并正常追加历史。老版本
+  服务当年没有记录更早的中间版本，这些内容无法凭空捏造——按那些版本号
+  读取会明确返回 `version_not_found`（`detail` 含请求的版本号），而不是
+  伪造内容。迁移是 `INSERT OR IGNORE`，重复打开不会重复回填。
+- **写入与幂等记录的原子性**：带 `Idempotency-Key` 的提交把"资源写入 +
+  历史快照 + 幂等记录"放在**同一个事务**里提交。服务在提交途中崩溃或
+  重启只会留下"都落库"或"都没落库"两种状态：前者让重启后的重试直接
+  重放首次记录的结果，后者让重试干净地重新执行这次写入——不会出现
+  写了一半导致重试报错的中间态。
 
 ## 版本历史读取
 
@@ -187,8 +200,50 @@ curl -X PUT 'http://127.0.0.1:8000/patients/p1?source_version=fhir-r4&expected_v
 #   -> 版本从 2 继续递增到 3，历史不断档
 ```
 
-测试覆盖：并发冲突（过期版本 vs 不存在的区分、重试安全性、多写者竞争、
-幂等 key 重试与并发去重）、重启后状态/历史/审计/幂等记录的持久性、
+### 复现老数据升级
+
+```bash
+# 1. 造一份"老版本服务"留下的库：只有 resources 当前行，没有历史表
+python - << 'PY'
+import json, sqlite3
+conn = sqlite3.connect("./data/legacy.db")
+conn.executescript("""
+CREATE TABLE resources (patient_id TEXT PRIMARY KEY, version INTEGER NOT NULL,
+                        updated_at REAL NOT NULL, body TEXT NOT NULL);
+""")
+body = json.dumps({"patient_id": "p1", "active": True,
+                   "identifiers": {"mrn": "M1"},
+                   "observations": [{"code": {"system": "http://loinc.org",
+                                              "code": "8480-6", "display": None},
+                                     "value": "120", "unit": None,
+                                     "effective": None}]}, sort_keys=True)
+conn.execute("INSERT INTO resources VALUES ('p1', 2, 1700000002.0, ?)", (body,))
+conn.commit(); conn.close()
+PY
+
+# 2. 用当前版本直接打开这份老库
+CLINICAL_DB=./data/legacy.db uv run uvicorn main:app --port 8000 &
+
+# 3. 验证：当前内容可读；历史不再为空（回填了当前版本 v2，含原写入时间）；
+#    v2 可按版本号取回；老服务没记录过的 v1 明确报 version_not_found
+curl -H 'X-Actor: alice' -H 'X-Role: clinician' http://127.0.0.1:8000/patients/p1
+curl -H 'X-Actor: alice' -H 'X-Role: clinician' http://127.0.0.1:8000/patients/p1/history
+curl -H 'X-Actor: alice' -H 'X-Role: clinician' http://127.0.0.1:8000/patients/p1/versions/2
+curl -H 'X-Actor: alice' -H 'X-Role: clinician' http://127.0.0.1:8000/patients/p1/versions/1
+#   -> 404 {"error": {"code": "version_not_found", ...}}
+
+# 4. 后续写入从 v2 继续递增到 v3，重启后历史为 [2, 3] 不断档
+```
+
+对应的自动化复现见 `tests/test_legacy_upgrade.py`（用旧 schema 建库 →
+当前版本打开 → 校验历史回填、按版本取回、继续写、再重启）。
+
+测试覆盖：老库升级（历史回填、按版本回看、不可恢复版本的明确报错、
+升级后继续写与再重启）、重启后状态/历史/审计/幂等记录的持久性、
+并发提交的成败分类（过期版本 vs 不存在的区分、多写者竞争恰好一个胜出、
+冲突 detail 含判定版本号、落盘库上并发后重启状态逐版本一致）、
+幂等重试（重试不多出版本、审计一记 success 一记 replayed、重启后重试
+仍重放、写入与幂等记录原子提交、失败提交不占用 key、并发同 key 去重）、
 版本历史顺序与按版本回溯、历史读取的角色控制与去标识化、三类失败原因
 （not_found / version_not_found / forbidden）的可区分性、版本不兼容
 （三类拒绝原因可区分）、越权读取与去标识化导出、审计完整性。

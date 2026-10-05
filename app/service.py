@@ -72,7 +72,8 @@ class ClinicalService:
                         "version": stored.version}
             fp = _fingerprint("ingest", source_version, payload)
             response, replayed = self._store.apply_idempotent(
-                idempotency_key, fp, lambda: self._store.create(resource))
+                idempotency_key, fp,
+                lambda: self._store.create(resource, commit=False))
             if replayed:
                 return {"_replayed": True, **response}
             return response
@@ -95,7 +96,8 @@ class ClinicalService:
                               expected_version, payload)
             response, replayed = self._store.apply_idempotent(
                 idempotency_key, fp,
-                lambda: self._store.update(resource, expected_version))
+                lambda: self._store.update(resource, expected_version,
+                                           commit=False))
             if replayed:
                 return {"_replayed": True, **response}
             return response
